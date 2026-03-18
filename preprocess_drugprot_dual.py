@@ -351,9 +351,16 @@ def process_split(
                 # Intentionally silent in rows; aggregated count can be added later if needed.
                 pass
 
-            # Relation-conditioned span rows.
-            # We create one row per relation query for this sentence.
-            query_relations = sorted(relation_vocab) if relation_vocab is not None else []
+            # Relation-conditioned span rows (existence-conditioned):
+            # create rows only for relations that are actually present in this sentence.
+            # This avoids query expansion into all-O negatives.
+            present_relations: Set[str] = set()
+            for _chem, _gene, _pid, rels in pairs:
+                present_relations.update(rels)
+            if relation_vocab is not None:
+                # Keep only relations seen in train vocab for stability.
+                present_relations = {r for r in present_relations if r in relation_vocab}
+            query_relations = sorted(present_relations)
 
             tokens, tok_offsets = tokenize_with_offsets(sent_text)
             for rel_name in query_relations:
@@ -372,23 +379,25 @@ def process_split(
 
                     chem_tok_idxs = token_indices_for_span(tok_offsets, chem_start, chem_end)
                     gene_tok_idxs = token_indices_for_span(tok_offsets, gene_start, gene_end)
+                    # Typed arguments while keeping non-directional relation matching.
                     apply_bio(tags, chem_tok_idxs, "CHEM")
                     apply_bio(tags, gene_tok_idxs, "GENE")
 
-                span_rows.append(
-                    {
-                        "id": f"{sentence_id}|rel:{rel_name}",
-                        "sentence_id": sentence_id,
-                        "doc_id": doc_id,
-                        "sent_idx": sent_idx,
-                        "text": sent_text,
-                        "relation": rel_name,
-                        "tokens": tokens,
-                        "bio_tags": tags,
-                        "is_null": pos_pair_count == 0,
-                        "positive_pair_count": pos_pair_count,
-                    }
-                )
+                if pos_pair_count > 0:
+                    span_rows.append(
+                        {
+                            "id": f"{sentence_id}|rel:{rel_name}",
+                            "sentence_id": sentence_id,
+                            "doc_id": doc_id,
+                            "sent_idx": sent_idx,
+                            "text": sent_text,
+                            "relation": rel_name,
+                            "tokens": tokens,
+                            "bio_tags": tags,
+                            "is_null": False,
+                            "positive_pair_count": pos_pair_count,
+                        }
+                    )
 
     return classic_rows, span_rows, observed_relations
 

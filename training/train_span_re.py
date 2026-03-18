@@ -259,12 +259,9 @@ class SpanSampleEvalCallback(TrainerCallback):
         pred_gene = decode_bio_spans(pred_tags, "GENE")
         gold_chem = decode_bio_spans(row["bio_tags"], "CHEM")
         gold_gene = decode_bio_spans(row["bio_tags"], "GENE")
-        pred_is_null = not any(t != "O" for t in pred_tags)
-        gold_is_null = bool(row.get("is_null", False))
 
         print(
             f"[sample-eval step {state.global_step}] rel={row['relation']} "
-            f"gold_null={gold_is_null} pred_null={pred_is_null} "
             f"gold_chem={gold_chem} pred_chem={pred_chem} "
             f"gold_gene={gold_gene} pred_gene={pred_gene}"
         )
@@ -356,51 +353,15 @@ def span_argument_metrics(eval_pred, id2label: Dict[int, str]) -> Dict[str, floa
     }
 
 
-def null_detection_metrics(
-    preds: np.ndarray, labels: np.ndarray, is_null_gold: List[int], id2label: Dict[int, str]
-) -> Dict[str, float]:
-    o_id = next((k for k, v in id2label.items() if v == "O"), None)
-    if o_id is None:
-        return {}
-
-    is_null_pred: List[int] = []
-    for p_row, l_row in zip(preds, labels):
-        row_pred_non_o = False
-        for p, l in zip(p_row, l_row):
-            if l == -100:
-                continue
-            if int(p) != o_id:
-                row_pred_non_o = True
-                break
-        is_null_pred.append(0 if row_pred_non_o else 1)
-
-    p, r, f1, _ = precision_recall_fscore_support(
-        is_null_gold, is_null_pred, average="binary", zero_division=0
-    )
-    return {
-        "null_precision": float(p),
-        "null_recall": float(r),
-        "null_f1": float(f1),
-    }
-
-
 def eval_split(trainer: Trainer, ds: SpanDataset, id2label: Dict[int, str], split_name: str) -> dict:
     pred_out = trainer.predict(ds)
     logits = pred_out.predictions
     labels = pred_out.label_ids
-    preds = np.argmax(logits, axis=-1)
     token_scores = token_metrics((logits, labels), id2label)
     span_scores = span_argument_metrics((logits, labels), id2label)
-    null_scores = null_detection_metrics(
-        preds=preds,
-        labels=labels,
-        is_null_gold=[int(r.get("is_null", False)) for r in ds.rows],
-        id2label=id2label,
-    )
     out = {f"{split_name}_{k}": float(v) for k, v in pred_out.metrics.items() if isinstance(v, (int, float))}
     out.update({f"{split_name}_{k}": v for k, v in token_scores.items()})
     out.update({f"{split_name}_{k}": v for k, v in span_scores.items()})
-    out.update({f"{split_name}_{k}": v for k, v in null_scores.items()})
     return out
 
 
@@ -468,17 +429,8 @@ def main() -> None:
             f"test dropped={n_test_raw - len(test_rows)}"
         )
 
-    has_valid_positive_tokens = any(
-        any(t != "O" for t in r["bio_tags"]) for r in valid_rows
-    )
-    best_metric_name = (
-        "eval_token_positive_micro_f1" if has_valid_positive_tokens else "eval_token_micro_f1"
-    )
-    if not has_valid_positive_tokens:
-        print(
-            "Validation set has no positive BIO tokens; "
-            "using eval_token_micro_f1 for best-model selection."
-        )
+    # Select best checkpoint by argument-level quality, not token-only quality.
+    best_metric_name = "eval_span_overlap_f1"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     model = AutoModelForTokenClassification.from_pretrained(

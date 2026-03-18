@@ -176,8 +176,6 @@ def eval_span(gold_rows: List[dict], pred_rows: List[dict]) -> dict:
 
     exact_tp = exact_fp = exact_fn = 0
     overlap_tp = overlap_fp = overlap_fn = 0
-    null_true: List[int] = []
-    null_pred: List[int] = []
 
     for i, g in enumerate(gold_rows):
         k = key_for_row(g, i)
@@ -212,9 +210,6 @@ def eval_span(gold_rows: List[dict], pred_rows: List[dict]) -> dict:
             overlap_fp += len(p_sp) - tp_o
             overlap_fn += len(g_sp) - tp_o
 
-        null_true.append(1 if g.get("is_null", False) else 0)
-        null_pred.append(1 if p.get("pred_is_null", False) else 0)
-
     if not token_true:
         return {"error": "No aligned rows for evaluation.", "missing_predictions": missing}
 
@@ -229,7 +224,7 @@ def eval_span(gold_rows: List[dict], pred_rows: List[dict]) -> dict:
     o_label = "O"
     out = {
         "n_gold": len(gold_rows),
-        "n_scored": len(null_true),
+        "n_scored": len(gold_rows) - missing,
         "missing_predictions": missing,
         "token_micro_f1": float(f1_micro),
         "token_macro_f1": float(f1_macro),
@@ -263,12 +258,6 @@ def eval_span(gold_rows: List[dict], pred_rows: List[dict]) -> dict:
         }
     )
 
-    p_n, r_n, f1_n, _ = precision_recall_fscore_support(
-        null_true, null_pred, average="binary", zero_division=0
-    )
-    out["null_precision"] = float(p_n)
-    out["null_recall"] = float(r_n)
-    out["null_f1"] = float(f1_n)
     return out
 
 
