@@ -8,7 +8,7 @@
 #SBATCH --output=logs/arg_recog_exp_%j.out
 #SBATCH --error=logs/arg_recog_exp_%j.err
 
-PROJECT_ROOT="${PROJECT_ROOT:-/Users/thomaslim/argument_recognition_experiment}"
+PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONDA_ENV="${CONDA_ENV:-indra}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/drugprot_dual}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs}"
@@ -22,6 +22,8 @@ SPAN_OOD_FILE="${SPAN_OOD_FILE:-}"
 mkdir -p "${PROJECT_ROOT}/logs" "${OUTPUT_ROOT}"
 
 cd "${PROJECT_ROOT}"
+echo "Running from: $(pwd)"
+
 source ~/.bashrc
 conda activate "${CONDA_ENV}"
 
