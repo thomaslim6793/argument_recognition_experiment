@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH --job-name=train_argument_recognition_experiment
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:h200:1
