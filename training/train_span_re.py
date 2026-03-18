@@ -160,6 +160,10 @@ def token_metrics(eval_pred, id2label: Dict[int, str]) -> Dict[str, float]:
             out["token_positive_micro_f1"] = float(f1_pos)
             out["token_positive_micro_precision"] = float(p_pos)
             out["token_positive_micro_recall"] = float(r_pos)
+        else:
+            out["token_positive_micro_f1"] = 0.0
+            out["token_positive_micro_precision"] = 0.0
+            out["token_positive_micro_recall"] = 0.0
     return out
 
 
@@ -444,13 +448,37 @@ def main() -> None:
     train_rows = read_jsonl(data_dir / "span_train.jsonl")
     valid_rows = read_jsonl(data_dir / "span_valid.jsonl")
     test_rows = read_jsonl(data_dir / "span_test.jsonl")
+    n_valid_raw = len(valid_rows)
+    n_test_raw = len(test_rows)
 
-    tag_list = sorted({t for r in (train_rows + valid_rows + test_rows) for t in r["bio_tags"]})
+    tag_list = sorted({t for r in train_rows for t in r["bio_tags"]})
     # Keep O first for readability.
     if "O" in tag_list:
         tag_list = ["O"] + [t for t in tag_list if t != "O"]
     label2id = {t: i for i, t in enumerate(tag_list)}
     id2label = {i: t for t, i in label2id.items()}
+
+    # Prevent crashes if unexpected tags appear outside train split.
+    valid_rows = [r for r in valid_rows if all(t in label2id for t in r["bio_tags"])]
+    test_rows = [r for r in test_rows if all(t in label2id for t in r["bio_tags"])]
+    if len(valid_rows) != n_valid_raw or len(test_rows) != n_test_raw:
+        print(
+            "Filtered rows with unseen BIO tags: "
+            f"valid dropped={n_valid_raw - len(valid_rows)}, "
+            f"test dropped={n_test_raw - len(test_rows)}"
+        )
+
+    has_valid_positive_tokens = any(
+        any(t != "O" for t in r["bio_tags"]) for r in valid_rows
+    )
+    best_metric_name = (
+        "eval_token_positive_micro_f1" if has_valid_positive_tokens else "eval_token_micro_f1"
+    )
+    if not has_valid_positive_tokens:
+        print(
+            "Validation set has no positive BIO tokens; "
+            "using eval_token_micro_f1 for best-model selection."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     model = AutoModelForTokenClassification.from_pretrained(
@@ -478,7 +506,7 @@ def main() -> None:
         save_strategy=args.save_strategy,
         logging_steps=args.logging_steps,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_token_positive_micro_f1",
+        metric_for_best_model=best_metric_name,
         greater_is_better=True,
         save_total_limit=2,
         fp16=args.fp16,
@@ -520,8 +548,14 @@ def main() -> None:
 
     if args.ood_file:
         ood_rows = read_jsonl(Path(args.ood_file))
+        n_ood_raw = len(ood_rows)
         # Keep only known tags.
         ood_rows = [r for r in ood_rows if all(t in label2id for t in r["bio_tags"])]
+        if len(ood_rows) != n_ood_raw:
+            print(
+                "Filtered OOD rows with unseen BIO tags: "
+                f"dropped={n_ood_raw - len(ood_rows)}"
+            )
         ood_ds = SpanDataset(ood_rows, tokenizer, label2id, args.max_length)
         eval_payload.update(eval_split(trainer, ood_ds, id2label, "ood"))
 

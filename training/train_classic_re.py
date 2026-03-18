@@ -279,10 +279,22 @@ def main() -> None:
     train_rows = read_jsonl(data_dir / "classic_train.jsonl")
     valid_rows = read_jsonl(data_dir / "classic_valid.jsonl")
     test_rows = read_jsonl(data_dir / "classic_test.jsonl")
+    n_valid_raw = len(valid_rows)
+    n_test_raw = len(test_rows)
 
-    labels = sorted({r["label"] for r in (train_rows + valid_rows + test_rows)})
+    labels = sorted({r["label"] for r in train_rows})
     label2id = {l: i for i, l in enumerate(labels)}
     id2label = {i: l for l, i in label2id.items()}
+
+    # Prevent crashes if a non-train label appears in valid/test unexpectedly.
+    valid_rows = [r for r in valid_rows if r["label"] in label2id]
+    test_rows = [r for r in test_rows if r["label"] in label2id]
+    if len(valid_rows) != n_valid_raw or len(test_rows) != n_test_raw:
+        print(
+            "Filtered rows with unseen labels: "
+            f"valid dropped={n_valid_raw - len(valid_rows)}, "
+            f"test dropped={n_test_raw - len(test_rows)}"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     tokenizer.add_special_tokens({"additional_special_tokens": ["[E1]", "[/E1]", "[E2]", "[/E2]"]})
@@ -353,8 +365,14 @@ def main() -> None:
 
     if args.ood_file:
         ood_rows = read_jsonl(Path(args.ood_file))
+        n_ood_raw = len(ood_rows)
         # Keep only labels seen during train.
         ood_rows = [r for r in ood_rows if r["label"] in label2id]
+        if len(ood_rows) != n_ood_raw:
+            print(
+                "Filtered OOD rows with unseen labels: "
+                f"dropped={n_ood_raw - len(ood_rows)}"
+            )
         ood_ds = ClassicDataset(ood_rows, tokenizer, label2id, args.max_length)
         eval_payload.update(eval_split(trainer, ood_ds, id2label, "ood"))
 
