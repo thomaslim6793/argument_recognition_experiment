@@ -28,6 +28,7 @@ from transformers import (
     AutoTokenizer,
     DataCollatorForTokenClassification,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -53,6 +54,27 @@ def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def upload_folder_to_hub(
+    folder_path: Path,
+    repo_id: str,
+    private: bool = False,
+    commit_message: str = "Upload best model",
+) -> str:
+    from huggingface_hub import HfApi, create_repo
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True, token=token)
+    api = HfApi(token=token)
+    api.upload_folder(
+        repo_id=repo_id,
+        repo_type="model",
+        folder_path=str(folder_path),
+        path_in_repo=".",
+        commit_message=commit_message,
+    )
+    return f"https://huggingface.co/{repo_id}"
 
 
 class SpanDataset(torch.utils.data.Dataset):
@@ -164,6 +186,85 @@ def decode_bio_spans(tags: List[str], role: str) -> List[Tuple[int, int]]:
     if start is not None:
         spans.append((start, len(tags)))
     return spans
+
+
+class SpanSampleEvalCallback(TrainerCallback):
+    """Print prediction on one validation example every k steps."""
+
+    def __init__(
+        self,
+        valid_rows: List[dict],
+        tokenizer,
+        max_length: int,
+        every_steps: int,
+        sample_index: int = 0,
+    ):
+        self.valid_rows = valid_rows
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.every_steps = every_steps
+        self.sample_index = sample_index
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if model is None or self.every_steps <= 0 or not self.valid_rows:
+            return control
+        if state.global_step <= 0 or (state.global_step % self.every_steps != 0):
+            return control
+
+        row = self.valid_rows[self.sample_index % len(self.valid_rows)]
+        rel_tokens = row["relation"].replace("-", " ").split()
+        sent_tokens = row["tokens"]
+
+        enc = self.tokenizer(
+            [rel_tokens],
+            [sent_tokens],
+            is_split_into_words=True,
+            truncation=True,
+            padding=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        device = next(model.parameters()).device
+        enc_dev = {k: v.to(device) for k, v in enc.items()}
+
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            logits = model(**enc_dev).logits
+            pred_ids = torch.argmax(logits, dim=-1).cpu().tolist()[0]
+        if was_training:
+            model.train()
+
+        id2label = {
+            int(k): v for k, v in model.config.id2label.items()
+        } if isinstance(model.config.id2label, dict) else model.config.id2label
+
+        word_ids = enc.word_ids(batch_index=0)
+        seq_ids = enc.sequence_ids(0)
+        sent_tag_ids = [-100] * len(sent_tokens)
+        prev_w = None
+        for pos, w in enumerate(word_ids):
+            if seq_ids[pos] != 1 or w is None:
+                continue
+            if w != prev_w and sent_tag_ids[w] == -100:
+                sent_tag_ids[w] = pred_ids[pos]
+            prev_w = w
+
+        pred_tags = [id2label[t] if t != -100 else "O" for t in sent_tag_ids]
+        pred_chem = decode_bio_spans(pred_tags, "CHEM")
+        pred_gene = decode_bio_spans(pred_tags, "GENE")
+        gold_chem = decode_bio_spans(row["bio_tags"], "CHEM")
+        gold_gene = decode_bio_spans(row["bio_tags"], "GENE")
+        pred_is_null = not any(t != "O" for t in pred_tags)
+        gold_is_null = bool(row.get("is_null", False))
+
+        print(
+            f"[sample-eval step {state.global_step}] rel={row['relation']} "
+            f"gold_null={gold_is_null} pred_null={pred_is_null} "
+            f"gold_chem={gold_chem} pred_chem={pred_chem} "
+            f"gold_gene={gold_gene} pred_gene={pred_gene}"
+        )
+        return control
 
 
 def _span_overlap(a: Tuple[int, int], b: Tuple[int, int]) -> int:
@@ -319,6 +420,22 @@ def main() -> None:
     parser.add_argument("--ood_file", type=str, default="")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--push_to_hub", action="store_true")
+    parser.add_argument("--hub_model_id", type=str, default="")
+    parser.add_argument("--hub_private", action="store_true")
+    parser.add_argument("--hub_commit_message", type=str, default="Upload best span RE model")
+    parser.add_argument(
+        "--sample_eval_steps",
+        type=int,
+        default=200,
+        help="Run one-example validation inference every k training steps (<=0 disables).",
+    )
+    parser.add_argument(
+        "--sample_eval_index",
+        type=int,
+        default=0,
+        help="Validation example index used for periodic sample inference.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -381,6 +498,15 @@ def main() -> None:
             **token_metrics(p, id2label),
             **span_argument_metrics(p, id2label),
         },
+        callbacks=[
+            SpanSampleEvalCallback(
+                valid_rows=valid_rows,
+                tokenizer=tokenizer,
+                max_length=args.max_length,
+                every_steps=args.sample_eval_steps,
+                sample_index=args.sample_eval_index,
+            )
+        ],
     )
 
     trainer.train()
@@ -409,8 +535,20 @@ def main() -> None:
     }
     write_json(out_dir / "metadata.json", metadata)
     write_json(out_dir / "eval_metrics.json", eval_payload)
-    trainer.save_model(str(out_dir / "best_model"))
-    tokenizer.save_pretrained(str(out_dir / "best_model"))
+    best_model_dir = out_dir / "best_model"
+    trainer.save_model(str(best_model_dir))
+    tokenizer.save_pretrained(str(best_model_dir))
+
+    if args.push_to_hub:
+        if not args.hub_model_id:
+            raise ValueError("--hub_model_id is required when --push_to_hub is set.")
+        hub_url = upload_folder_to_hub(
+            folder_path=best_model_dir,
+            repo_id=args.hub_model_id,
+            private=args.hub_private,
+            commit_message=args.hub_commit_message,
+        )
+        print(f"Uploaded model to: {hub_url}")
 
     print("Training complete.")
     print(f"Saved results to: {out_dir}")
